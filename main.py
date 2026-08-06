@@ -1,23 +1,15 @@
 """
 Backend del Comparador P2P — Multi-país
 =====================================
-Centraliza las consultas a Binance P2P, OKX P2P y BingX P2P (esta última vía
-la API oficial de P2P.Army, ya que BingX no tiene API pública propia) y
-expone un único endpoint sencillo para el frontend.
+Centraliza las consultas a Binance P2P, OKX P2P, Bybit P2P y BingX P2P (esta
+última vía la API oficial de P2P.Army, ya que BingX no tiene API pública
+propia) y expone un único endpoint sencillo para el frontend.
 
 CONFIGURAR PARA OTRO PAÍS:
-    Este backend ya no está fijo a Venezuela. La moneda (fiat) se controla
-    con la variable de entorno FIAT_DEFAULT. Para adaptarlo a otro país:
+    La moneda (fiat) se controla con la variable de entorno FIAT_DEFAULT.
+    En Railway: Variables -> FIAT_DEFAULT = COP (o ARS, MXN, etc.)
 
-    En Railway: ve a tu servicio -> pestaña "Variables" -> Agrega:
-        FIAT_DEFAULT = COP   (o ARS, MXN, PEN, BRL, etc. — el código de
-                               moneda que uses en Binance/OKX/BingX P2P)
-
-    No hace falta tocar ni una línea de este archivo. Railway reinicia el
-    servicio solo y ya queda funcionando para el país nuevo.
-
-    Bonus: también puedes pedir un país puntual sin cambiar la variable,
-    llamando al endpoint con ?fiat=COP, ej:
+    También se puede pedir un país puntual sin cambiar la variable:
         /api/precios?fiat=COP
 
 Ejecutar localmente:
@@ -38,7 +30,6 @@ import os
 
 app = FastAPI(title="Comparador P2P Multi-país")
 
-# Permite que la PWA (desde cualquier origen) consuma esta API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,20 +43,13 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 }
 
-# ── Configuración de país/moneda ─────────────────────────────────────────
-# FIAT_DEFAULT se lee de la variable de entorno del hosting (Railway).
-# Si no está configurada, usa "VES" como respaldo.
 FIAT_DEFAULT = os.environ.get("FIAT_DEFAULT", "VES")
 ASSET = "USDT"
 ROWS = 10
 DEBUG = True
 
-# API key de P2P.Army (plan gratuito). Es más seguro moverla a variable de
-# entorno también (Railway: Variables -> P2P_ARMY_API_KEY).
 P2P_ARMY_API_KEY = os.environ.get("P2P_ARMY_API_KEY", "GLJS5BWI-BEBVK7VO")
 
-# Cache simple en memoria, separado por país, para no golpear las APIs de
-# origen en cada request.
 _cache = {}
 CACHE_SEGUNDOS = 45
 
@@ -135,12 +119,52 @@ def obtener_okx(side: str, fiat: str):
         return []
 
 
+def obtener_bybit(side: str, fiat: str):
+    """
+    Trae precios de Bybit P2P a través del endpoint interno que usa su propia
+    página web (no es la API oficial para desarrolladores, que requiere
+    cuenta de comerciante verificado). side: "0" = comprar (ads de venta),
+    "1" = vender (ads de compra).
+    """
+    url = "https://api2.bybit.com/fiat/otc/item/online"
+    payload = {
+        "userId": "",
+        "tokenId": ASSET,
+        "currencyId": fiat,
+        "payment": [],
+        "side": side,
+        "size": str(ROWS),
+        "page": "1",
+        "amount": "",
+        "authMaker": False,
+        "canTrade": False,
+    }
+    try:
+        r = requests.post(url, json=payload, headers=HEADERS, timeout=10)
+        if DEBUG:
+            print(f"  [Bybit][DEBUG] status={r.status_code}")
+            print(f"  [Bybit][DEBUG] respuesta cruda (primeros 500 chars):\n{r.text[:500]}\n")
+        r.raise_for_status()
+        body = r.json()
+        items = (body.get("result") or {}).get("items", []) or []
+        precios = []
+        for item in items[:ROWS]:
+            precio = float(item.get("price", 0))
+            if precio <= 0:
+                continue
+            precios.append({
+                "precio": precio,
+                "comerciante": item.get("nickName", "desconocido"),
+                "min": float(item.get("minAmount", 0)),
+                "max": float(item.get("maxAmount", 0)),
+            })
+        return precios
+    except Exception:
+        traceback.print_exc()
+        return []
+
+
 def obtener_bingx_precios(fiat: str):
-    """
-    Trae precios de BingX P2P a través de la API oficial de P2P.Army
-    (agregador legítimo que sí tiene acceso autorizado a BingX).
-    Devuelve una tupla (lista_comprar, lista_vender).
-    """
     url = "https://p2p.army/v1/api/get_p2p_prices"
     headers = {"X-APIKEY": P2P_ARMY_API_KEY, "Content-Type": "application/json"}
     payload = {"market": "bingx", "fiat": fiat, "asset": ASSET, "limit": ROWS}
@@ -180,7 +204,7 @@ def mejor(precios, modo):
     return min(precios, key=lambda x: x["precio"]) if modo == "comprar" else max(precios, key=lambda x: x["precio"])
 
 
-UMBRAL_ATIPICO = 0.05  # descarta anuncios que se desvían más de 5% del precio de referencia del mercado
+UMBRAL_ATIPICO = 0.05
 
 
 def filtrar_atipicos(precios, precio_referencia):
@@ -202,6 +226,7 @@ def construir_respuesta(fiat: str):
     fuentes = {
         "Binance": {"comprar": obtener_binance("BUY", fiat), "vender": obtener_binance("SELL", fiat)},
         "OKX": {"comprar": obtener_okx("buy", fiat), "vender": obtener_okx("sell", fiat)},
+        "Bybit": {"comprar": obtener_bybit("0", fiat), "vender": obtener_bybit("1", fiat)},
         "BingX": {"comprar": bingx_compra, "vender": bingx_venta},
     }
 
@@ -269,11 +294,7 @@ def debug_okx(fiat: str = None):
     }
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        return {
-            "status_code": r.status_code,
-            "url_llamada": r.url,
-            "respuesta_cruda": r.text[:2000],
-        }
+        return {"status_code": r.status_code, "url_llamada": r.url, "respuesta_cruda": r.text[:2000]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -288,10 +309,31 @@ def debug_binance(fiat: str = None):
     }
     try:
         r = requests.post(url, json=payload, headers=HEADERS, timeout=10)
-        return {
-            "status_code": r.status_code,
-            "respuesta_cruda": r.text[:2000],
-        }
+        return {"status_code": r.status_code, "respuesta_cruda": r.text[:2000]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/debug/bybit")
+def debug_bybit(fiat: str = None):
+    """Devuelve la respuesta cruda de Bybit tal cual, sin procesarla, para diagnóstico."""
+    fiat_usado = (fiat or FIAT_DEFAULT).upper()
+    url = "https://api2.bybit.com/fiat/otc/item/online"
+    payload = {
+        "userId": "",
+        "tokenId": ASSET,
+        "currencyId": fiat_usado,
+        "payment": [],
+        "side": "0",
+        "size": str(ROWS),
+        "page": "1",
+        "amount": "",
+        "authMaker": False,
+        "canTrade": False,
+    }
+    try:
+        r = requests.post(url, json=payload, headers=HEADERS, timeout=10)
+        return {"status_code": r.status_code, "respuesta_cruda": r.text[:2000]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -304,9 +346,6 @@ def debug_bingx(fiat: str = None):
     payload = {"market": "bingx", "fiat": fiat_usado, "asset": ASSET, "limit": ROWS}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=10)
-        return {
-            "status_code": r.status_code,
-            "respuesta_cruda": r.text[:2000],
-        }
+        return {"status_code": r.status_code, "respuesta_cruda": r.text[:2000]}
     except Exception as e:
         return {"error": str(e)}
