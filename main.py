@@ -1,22 +1,32 @@
 """
-Backend del Comparador P2P USDT/VES
+Backend del Comparador P2P — Multi-país
 =====================================
 Centraliza las consultas a Binance P2P, OKX P2P y BingX P2P (esta última vía
 la API oficial de P2P.Army, ya que BingX no tiene API pública propia) y
 expone un único endpoint sencillo para el frontend.
 
+CONFIGURAR PARA OTRO PAÍS:
+    Este backend ya no está fijo a Venezuela. La moneda (fiat) se controla
+    con la variable de entorno FIAT_DEFAULT. Para adaptarlo a otro país:
+
+    En Railway: ve a tu servicio -> pestaña "Variables" -> Agrega:
+        FIAT_DEFAULT = COP   (o ARS, MXN, PEN, BRL, etc. — el código de
+                               moneda que uses en Binance/OKX/BingX P2P)
+
+    No hace falta tocar ni una línea de este archivo. Railway reinicia el
+    servicio solo y ya queda funcionando para el país nuevo.
+
+    Bonus: también puedes pedir un país puntual sin cambiar la variable,
+    llamando al endpoint con ?fiat=COP, ej:
+        /api/precios?fiat=COP
+
 Ejecutar localmente:
     pip install fastapi uvicorn requests
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-Desplegar gratis (recomendado para que la app funcione desde cualquier lado,
-no solo en tu red local): Render.com, Railway.app o Fly.io. Sube esta carpeta
-"backend" a un repo de GitHub y conéctalo a cualquiera de esos servicios;
-todos detectan FastAPI/uvicorn automáticamente si agregas un Procfile
-(incluido abajo) o usan el comando de start.
-
 Endpoint principal:
-    GET /api/precios  -> JSON con mejor compra, mejor venta y spread
+    GET /api/precios              -> usa el país configurado por defecto
+    GET /api/precios?fiat=COP     -> fuerza un país puntual
 """
 
 from fastapi import FastAPI
@@ -24,8 +34,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import time
 import traceback
+import os
 
-app = FastAPI(title="Comparador P2P USDT/VES")
+app = FastAPI(title="Comparador P2P Multi-país")
 
 # Permite que la PWA (desde cualquier origen) consuma esta API
 app.add_middleware(
@@ -41,26 +52,28 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 }
 
-FIAT = "VES"
+# ── Configuración de país/moneda ─────────────────────────────────────────
+# FIAT_DEFAULT se lee de la variable de entorno del hosting (Railway).
+# Si no está configurada, usa "VES" como respaldo.
+FIAT_DEFAULT = os.environ.get("FIAT_DEFAULT", "VES")
 ASSET = "USDT"
 ROWS = 10
 DEBUG = True
 
-# API key de P2P.Army (plan gratuito). Cuando despliegues esto en Render/Railway,
-# es más seguro moverla a una variable de entorno en vez de dejarla escrita aquí
-# (Render: Settings -> Environment -> Add Variable, y luego
-# P2P_ARMY_API_KEY = os.environ.get("P2P_ARMY_API_KEY")).
-P2P_ARMY_API_KEY = "GLJS5BWI-BEBVK7VO"
+# API key de P2P.Army (plan gratuito). Es más seguro moverla a variable de
+# entorno también (Railway: Variables -> P2P_ARMY_API_KEY).
+P2P_ARMY_API_KEY = os.environ.get("P2P_ARMY_API_KEY", "GLJS5BWI-BEBVK7VO")
 
-# Cache simple en memoria para no golpear las APIs de origen en cada request
-_cache = {"data": None, "ts": 0}
+# Cache simple en memoria, separado por país, para no golpear las APIs de
+# origen en cada request.
+_cache = {}
 CACHE_SEGUNDOS = 45
 
 
-def obtener_binance(trade_type: str):
+def obtener_binance(trade_type: str, fiat: str):
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     payload = {
-        "asset": ASSET, "fiat": FIAT, "tradeType": trade_type,
+        "asset": ASSET, "fiat": fiat, "tradeType": trade_type,
         "page": 1, "rows": ROWS, "payTypes": [], "publisherType": None,
     }
     try:
@@ -82,11 +95,11 @@ def obtener_binance(trade_type: str):
         return []
 
 
-def obtener_okx(side: str):
+def obtener_okx(side: str, fiat: str):
     url = "https://www.okx.com/v3/c2c/tradingOrders/books"
     params = {
         "t": int(time.time() * 1000),
-        "quoteCurrency": FIAT.lower(),
+        "quoteCurrency": fiat.lower(),
         "baseCurrency": ASSET.lower(),
         "side": side,
         "paymentMethod": "all",
@@ -122,7 +135,7 @@ def obtener_okx(side: str):
         return []
 
 
-def obtener_bingx_precios():
+def obtener_bingx_precios(fiat: str):
     """
     Trae precios de BingX P2P a través de la API oficial de P2P.Army
     (agregador legítimo que sí tiene acceso autorizado a BingX).
@@ -130,7 +143,7 @@ def obtener_bingx_precios():
     """
     url = "https://p2p.army/v1/api/get_p2p_prices"
     headers = {"X-APIKEY": P2P_ARMY_API_KEY, "Content-Type": "application/json"}
-    payload = {"market": "bingx", "fiat": FIAT, "asset": ASSET, "limit": ROWS}
+    payload = {"market": "bingx", "fiat": fiat, "asset": ASSET, "limit": ROWS}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=10)
         if DEBUG:
@@ -171,12 +184,6 @@ UMBRAL_ATIPICO = 0.05  # descarta anuncios que se desvían más de 5% del precio
 
 
 def filtrar_atipicos(precios, precio_referencia):
-    """
-    Elimina anuncios cuyo precio se desvía demasiado del precio de referencia
-    del mercado (ej. comerciantes con condiciones raras, errores de precio,
-    o trampas). Si no hay suficientes datos para calcular una referencia
-    confiable, no filtra nada.
-    """
     if precio_referencia is None:
         return precios
     return [p for p in precios if abs(p["precio"] - precio_referencia) / precio_referencia <= UMBRAL_ATIPICO]
@@ -190,19 +197,14 @@ def mediana(valores):
     return valores[n // 2] if n % 2 else (valores[n // 2 - 1] + valores[n // 2]) / 2
 
 
-def construir_respuesta():
-    bingx_compra, bingx_venta = obtener_bingx_precios()
+def construir_respuesta(fiat: str):
+    bingx_compra, bingx_venta = obtener_bingx_precios(fiat)
     fuentes = {
-        "Binance": {"comprar": obtener_binance("BUY"), "vender": obtener_binance("SELL")},
-        "OKX": {"comprar": obtener_okx("buy"), "vender": obtener_okx("sell")},
+        "Binance": {"comprar": obtener_binance("BUY", fiat), "vender": obtener_binance("SELL", fiat)},
+        "OKX": {"comprar": obtener_okx("buy", fiat), "vender": obtener_okx("sell", fiat)},
         "BingX": {"comprar": bingx_compra, "vender": bingx_venta},
     }
 
-    # El precio de referencia del mercado se calcula con la mediana de TODOS
-    # los anuncios (compra + venta, de las tres plataformas juntas). Usar el
-    # mercado completo como referencia -en vez de comparar "venta contra venta"
-    # únicamente- evita que un grupo pequeño de anuncios de venta ya inflados
-    # se validen entre sí como si fueran "normales".
     todos = [p["precio"] for lados in fuentes.values() for p in lados["comprar"] + lados["vender"]]
     precio_referencia = mediana(todos)
 
@@ -226,7 +228,7 @@ def construir_respuesta():
 
     return {
         "actualizado": int(time.time()),
-        "par": f"{ASSET}/{FIAT}",
+        "par": f"{ASSET}/{fiat}",
         "mejor_compra": compra[:5],
         "mejor_venta": venta[:5],
         "spread": spread,
@@ -235,28 +237,29 @@ def construir_respuesta():
 
 
 @app.get("/api/precios")
-def precios():
+def precios(fiat: str = None):
+    fiat_usado = (fiat or FIAT_DEFAULT).upper()
     now = time.time()
-    if _cache["data"] and (now - _cache["ts"] < CACHE_SEGUNDOS):
-        return _cache["data"]
-    data = construir_respuesta()
-    _cache["data"] = data
-    _cache["ts"] = now
+    cacheado = _cache.get(fiat_usado)
+    if cacheado and (now - cacheado["ts"] < CACHE_SEGUNDOS):
+        return cacheado["data"]
+    data = construir_respuesta(fiat_usado)
+    _cache[fiat_usado] = {"data": data, "ts": now}
     return data
 
 
 @app.get("/")
 def health():
-    return {"status": "ok", "servicio": "Comparador P2P USDT/VES"}
+    return {"status": "ok", "servicio": "Comparador P2P Multi-país", "fiat_por_defecto": FIAT_DEFAULT}
 
 
 @app.get("/api/debug/okx")
-def debug_okx():
-    """Devuelve la respuesta cruda de OKX tal cual, sin procesarla, para diagnóstico."""
+def debug_okx(fiat: str = None):
+    fiat_usado = (fiat or FIAT_DEFAULT).upper()
     url = "https://www.okx.com/v3/c2c/tradingOrders/books"
     params = {
         "t": int(time.time() * 1000),
-        "quoteCurrency": FIAT.lower(),
+        "quoteCurrency": fiat_usado.lower(),
         "baseCurrency": ASSET.lower(),
         "side": "buy",
         "paymentMethod": "all",
@@ -276,11 +279,11 @@ def debug_okx():
 
 
 @app.get("/api/debug/binance")
-def debug_binance():
-    """Devuelve la respuesta cruda de Binance tal cual, sin procesarla, para diagnóstico."""
+def debug_binance(fiat: str = None):
+    fiat_usado = (fiat or FIAT_DEFAULT).upper()
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     payload = {
-        "asset": ASSET, "fiat": FIAT, "tradeType": "SELL",
+        "asset": ASSET, "fiat": fiat_usado, "tradeType": "SELL",
         "page": 1, "rows": ROWS, "payTypes": [], "publisherType": None,
     }
     try:
@@ -294,11 +297,11 @@ def debug_binance():
 
 
 @app.get("/api/debug/bingx")
-def debug_bingx():
-    """Devuelve la respuesta cruda de P2P.Army (BingX) tal cual, sin procesarla, para diagnóstico."""
+def debug_bingx(fiat: str = None):
+    fiat_usado = (fiat or FIAT_DEFAULT).upper()
     url = "https://p2p.army/v1/api/get_p2p_prices"
     headers = {"X-APIKEY": P2P_ARMY_API_KEY, "Content-Type": "application/json"}
-    payload = {"market": "bingx", "fiat": FIAT, "asset": ASSET, "limit": ROWS}
+    payload = {"market": "bingx", "fiat": fiat_usado, "asset": ASSET, "limit": ROWS}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=10)
         return {
