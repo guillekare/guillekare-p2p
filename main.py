@@ -78,6 +78,16 @@ def obtener_binance(trade_type: str):
         precios = []
         for item in data:
             adv = item["adv"]
+            # Anuncios que exigen verificacion KYC adicional al comprador no
+            # son operables para un usuario comun (Binance los oculta o los
+            # muestra distinto en su propia app/web segun el nivel de cuenta
+            # de cada quien). Los descartamos para reflejar el precio real
+            # disponible, igual que ya se hace con "verificationRequired" en
+            # OKX.
+            if adv.get("takerAdditionalKycRequired") == 1:
+                continue
+            if adv.get("isTradable") is False:
+                continue
             precios.append({
                 "precio": float(adv["price"]),
                 "comerciante": item["advertiser"]["nickName"],
@@ -291,17 +301,34 @@ def debug_okx():
 
 @app.get("/api/debug/binance")
 def debug_binance():
-    """Devuelve la respuesta cruda de Binance tal cual, sin procesarla, para diagnostico."""
+    """
+    Devuelve un resumen legible de los anuncios de Binance (precio,
+    comerciante, y si requieren KYC adicional o no son operables), para
+    diagnosticar diferencias contra lo que muestra la app/web oficial.
+    """
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     payload = {
-        "asset": ASSET, "fiat": FIAT, "tradeType": "SELL",
+        "asset": ASSET, "fiat": FIAT, "tradeType": "BUY",
         "page": 1, "rows": ROWS, "payTypes": [], "publisherType": None,
     }
     try:
         r = requests.post(url, json=payload, headers=HEADERS, timeout=10)
+        data = r.json().get("data", [])
+        resumen = [
+            {
+                "precio": adv.get("price"),
+                "comerciante": item.get("advertiser", {}).get("nickName"),
+                "kyc_adicional_requerido": adv.get("takerAdditionalKycRequired"),
+                "es_operable": adv.get("isTradable"),
+                "metodo_pago": adv.get("tradeMethods", [{}])[0].get("tradeMethodName") if adv.get("tradeMethods") else None,
+            }
+            for item in data
+            for adv in [item.get("adv", {})]
+        ]
         return {
             "status_code": r.status_code,
-            "respuesta_cruda": r.text[:2000],
+            "cantidad_anuncios": len(resumen),
+            "anuncios": resumen,
         }
     except Exception as e:
         return {"error": str(e)}
