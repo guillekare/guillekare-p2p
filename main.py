@@ -36,6 +36,8 @@ from playwright.async_api import async_playwright
 import requests
 import time
 import traceback
+import subprocess
+import sys
 
 # ------------------------------------------------------------------
 # Playwright: un solo navegador vivo durante toda la vida del server,
@@ -46,8 +48,33 @@ _browser = None
 _bybit_page = None
 
 
+def asegurar_chromium_instalado():
+    """
+    Si el build del servidor no llego a instalar el navegador de Playwright
+    (puede pasar segun el builder que use la plataforma de hosting), lo
+    instalamos aca mismo al arrancar. Solo se descarga una vez; en arranques
+    posteriores Playwright detecta que ya esta y no vuelve a bajarlo.
+    """
+    try:
+        print("[Bybit] Verificando/instalando Chromium para Playwright...")
+        resultado = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+            capture_output=True, text=True, timeout=300,
+        )
+        if resultado.returncode != 0:
+            print("[Bybit] Aviso al instalar Chromium (puede no ser fatal):")
+            print(resultado.stdout[-1000:])
+            print(resultado.stderr[-1000:])
+        else:
+            print("[Bybit] Chromium listo.")
+    except Exception:
+        print("[Bybit] No se pudo correr la instalacion automatica de Chromium:")
+        traceback.print_exc()
+
+
 async def iniciar_bybit_browser():
     global _pw, _browser, _bybit_page
+    asegurar_chromium_instalado()
     try:
         _pw = await async_playwright().start()
         _browser = await _pw.chromium.launch(headless=True)
