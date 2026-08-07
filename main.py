@@ -1,31 +1,82 @@
 """
 Backend del Comparador P2P USDT/VES
 =====================================
-Centraliza las consultas a Binance P2P, OKX P2P y BingX P2P (esta última vía
-la API oficial de P2P.Army, ya que BingX no tiene API pública propia) y
-expone un único endpoint sencillo para el frontend.
+Centraliza las consultas a Binance P2P, OKX P2P, BingX P2P (via P2P.Army) y
+Bybit P2P (via Playwright, porque Bybit bloquea peticiones directas con
+Akamai) y expone un unico endpoint sencillo para el frontend.
 
 Ejecutar localmente:
-    pip install fastapi uvicorn requests
+    pip install fastapi uvicorn requests playwright
+    playwright install chromium
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 Desplegar gratis (recomendado para que la app funcione desde cualquier lado,
 no solo en tu red local): Render.com, Railway.app o Fly.io. Sube esta carpeta
-"backend" a un repo de GitHub y conéctalo a cualquiera de esos servicios;
-todos detectan FastAPI/uvicorn automáticamente si agregas un Procfile
-(incluido abajo) o usan el comando de start.
+"backend" a un repo de GitHub y conectalo a cualquiera de esos servicios.
+
+IMPORTANTE sobre Bybit + Playwright en produccion:
+    Playwright necesita el binario de Chromium instalado en el servidor, no
+    solo la libreria de Python. En Render, en el "Build Command" tenes que
+    poner:
+        pip install -r requirements.txt && playwright install --with-deps chromium
+    Esto hace el build mas lento y pesado (puede tardar varios minutos y usa
+    mas RAM en runtime). Si tu plan gratuito de Render/Railway anda muy justo
+    de memoria, Bybit puede fallar por falta de recursos aunque el resto
+    funcione bien - en ese caso, lo mas facil es comentar la fuente Bybit en
+    "fuentes" del endpoint /api/precios y listo, el resto sigue funcionando.
 
 Endpoint principal:
     GET /api/precios  -> JSON con mejor compra, mejor venta y spread
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from playwright.async_api import async_playwright
 import requests
 import time
 import traceback
 
-app = FastAPI(title="Comparador P2P USDT/VES")
+# ------------------------------------------------------------------
+# Playwright: un solo navegador vivo durante toda la vida del server,
+# para no pagar el costo de abrir/cerrar Chrome en cada request.
+# ------------------------------------------------------------------
+_pw = None
+_browser = None
+_bybit_page = None
+
+
+async def iniciar_bybit_browser():
+    global _pw, _browser, _bybit_page
+    try:
+        _pw = await async_playwright().start()
+        _browser = await _pw.chromium.launch(headless=True)
+        _bybit_page = await _browser.new_page()
+        await _bybit_page.goto("https://www.bybit.com/es-AR/p2p/buy/USDT/VES")
+        await _bybit_page.wait_for_timeout(4000)
+        print("[Bybit] Navegador Playwright listo.")
+    except Exception:
+        print("[Bybit] No se pudo iniciar Playwright, esta fuente quedara vacia:")
+        traceback.print_exc()
+        _bybit_page = None
+
+
+async def cerrar_bybit_browser():
+    global _pw, _browser
+    if _browser:
+        await _browser.close()
+    if _pw:
+        await _pw.stop()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await iniciar_bybit_browser()
+    yield
+    await cerrar_bybit_browser()
+
+
+app = FastAPI(title="Comparador P2P USDT/VES", lifespan=lifespan)
 
 # Permite que la PWA (desde cualquier origen) consuma esta API
 app.add_middleware(
@@ -47,7 +98,7 @@ ROWS = 20
 DEBUG = True
 
 # API key de P2P.Army (plan gratuito). Cuando despliegues esto en Render/Railway,
-# es más seguro moverla a una variable de entorno en vez de dejarla escrita aquí
+# es mas seguro moverla a una variable de entorno en vez de dejarla escrita aqui
 # (Render: Settings -> Environment -> Add Variable, y luego
 # P2P_ARMY_API_KEY = os.environ.get("P2P_ARMY_API_KEY")).
 P2P_ARMY_API_KEY = "GLJS5BWI-BEBVK7VO"
@@ -133,8 +184,8 @@ def obtener_okx(side: str):
 
 def obtener_bingx_precios():
     """
-    Trae precios de BingX P2P a través de la API oficial de P2P.Army
-    (agregador legítimo que sí tiene acceso autorizado a BingX).
+    Trae precios de BingX P2P a traves de la API oficial de P2P.Army
+    (agregador legitimo que si tiene acceso autorizado a BingX).
     Devuelve una tupla (lista_comprar, lista_vender).
     """
     url = "https://p2p.army/v1/api/get_p2p_prices"
@@ -170,18 +221,76 @@ def obtener_bingx_precios():
         return [], []
 
 
+async def obtener_bybit_precios():
+    """
+    Trae precios de Bybit P2P usando el navegador Playwright que dejamos
+    abierto en el arranque del server (asi Akamai lo ve como un navegador
+    real y no bloquea la peticion con 403).
+    Devuelve una tupla (lista_comprar, lista_vender).
+    """
+    global _bybit_page
+    if _bybit_page is None:
+        return [], []
+
+    async def pedir(side: str):
+        try:
+            result = await _bybit_page.evaluate(f"""
+                async () => {{
+                    const res = await fetch("https://www.bybit.com/x-api/fiat/otc/item/online", {{
+                        method: "POST",
+                        headers: {{"Content-Type": "application/json;charset=UTF-8"}},
+                        body: JSON.stringify({{
+                            tokenId: "{ASSET}", currencyId: "{FIAT}",
+                            payment: [], side: "{side}", size: "{ROWS}", page: "1",
+                            amount: "", authMaker: false, bulkMaker: false,
+                            canTrade: false, countryCode: "", itemRegion: 1,
+                            paymentPeriod: [], sortType: "OVERALL_RANKING",
+                            tradeWith: false, vaMaker: true, verificationFilter: 0
+                        }}),
+                        credentials: "include"
+                    }});
+                    return await res.json();
+                }}
+            """)
+            items = result.get("result", {}).get("items", [])
+            precios = []
+            for item in items:
+                precio = float(item.get("price", 0))
+                if precio <= 0:
+                    continue
+                precios.append({
+                    "precio": precio,
+                    "comerciante": item.get("nickName", "desconocido"),
+                    "min": float(item.get("minAmount", 0) or 0),
+                    "max": float(item.get("maxAmount", 0) or 0),
+                })
+            return precios
+        except Exception:
+            traceback.print_exc()
+            return []
+
+    # side "1" = anuncios de venta de USDT (el usuario compra) -> nuestra "comprar"
+    # side "0" = anuncios de compra de USDT (el usuario vende)  -> nuestra "vender"
+    compra = await pedir("1")
+    venta = await pedir("0")
+    return compra, venta
+
+
 def mejor(precios, modo):
     if not precios:
         return None
     return min(precios, key=lambda x: x["precio"]) if modo == "comprar" else max(precios, key=lambda x: x["precio"])
 
 
-def construir_respuesta():
+async def construir_respuesta():
     bingx_compra, bingx_venta = obtener_bingx_precios()
+    bybit_compra, bybit_venta = await obtener_bybit_precios()
+
     fuentes = {
         "Binance": {"comprar": obtener_binance("BUY"), "vender": obtener_binance("SELL")},
         "OKX": {"comprar": obtener_okx("sell"), "vender": obtener_okx("buy")},
         "BingX": {"comprar": bingx_compra, "vender": bingx_venta},
+        "Bybit": {"comprar": bybit_compra, "vender": bybit_venta},
     }
 
     compra, venta = [], []
@@ -211,11 +320,11 @@ def construir_respuesta():
 
 
 @app.get("/api/precios")
-def precios():
+async def precios():
     now = time.time()
     if _cache["data"] and (now - _cache["ts"] < CACHE_SEGUNDOS):
         return _cache["data"]
-    data = construir_respuesta()
+    data = await construir_respuesta()
     _cache["data"] = data
     _cache["ts"] = now
     return data
@@ -228,7 +337,7 @@ def health():
 
 @app.get("/api/debug/okx")
 def debug_okx():
-    """Devuelve la respuesta cruda de OKX tal cual, sin procesarla, para diagnóstico."""
+    """Devuelve la respuesta cruda de OKX tal cual, sin procesarla, para diagnostico."""
     url = "https://www.okx.com/v3/c2c/tradingOrders/books"
     params = {
         "t": int(time.time() * 1000),
@@ -270,7 +379,7 @@ def debug_okx():
 
 @app.get("/api/debug/binance")
 def debug_binance():
-    """Devuelve la respuesta cruda de Binance tal cual, sin procesarla, para diagnóstico."""
+    """Devuelve la respuesta cruda de Binance tal cual, sin procesarla, para diagnostico."""
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     payload = {
         "asset": ASSET, "fiat": FIAT, "tradeType": "SELL",
@@ -288,7 +397,7 @@ def debug_binance():
 
 @app.get("/api/debug/bingx")
 def debug_bingx():
-    """Devuelve la respuesta cruda de P2P.Army (BingX) tal cual, sin procesarla, para diagnóstico."""
+    """Devuelve la respuesta cruda de P2P.Army (BingX) tal cual, sin procesarla, para diagnostico."""
     url = "https://p2p.army/v1/api/get_p2p_prices"
     headers = {"X-APIKEY": P2P_ARMY_API_KEY, "Content-Type": "application/json"}
     payload = {"market": "bingx", "fiat": FIAT, "asset": ASSET, "limit": ROWS}
@@ -298,5 +407,15 @@ def debug_bingx():
             "status_code": r.status_code,
             "respuesta_cruda": r.text[:2000],
         }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/debug/bybit")
+async def debug_bybit():
+    """Devuelve compra/venta crudos de Bybit tal cual, sin procesar, para diagnostico."""
+    try:
+        compra, venta = await obtener_bybit_precios()
+        return {"compra": compra, "venta": venta}
     except Exception as e:
         return {"error": str(e)}
