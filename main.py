@@ -115,18 +115,9 @@ def obtener_okx(side: str):
         else:
             data = []
         precios = []
-        OKX_MIN_OPERACIONES = 100
-        OKX_MIN_TASA_EXITO = 0.95
         for item in data[:ROWS]:
             precio = float(item.get("price", 0))
             if precio <= 0:
-                continue
-            operaciones = item.get("completedOrderQuantity", 0) or 0
-            try:
-                tasa = float(item.get("completedRate", 0) or 0)
-            except (TypeError, ValueError):
-                tasa = 0
-            if operaciones < OKX_MIN_OPERACIONES or tasa < OKX_MIN_TASA_EXITO:
                 continue
             precios.append({
                 "precio": precio,
@@ -185,29 +176,6 @@ def mejor(precios, modo):
     return min(precios, key=lambda x: x["precio"]) if modo == "comprar" else max(precios, key=lambda x: x["precio"])
 
 
-UMBRAL_ATIPICO = 0.08  # descarta anuncios que se desvían más de 8% del precio de referencia del mercado
-
-
-def filtrar_atipicos(precios, precio_referencia):
-    """
-    Elimina anuncios cuyo precio se desvía demasiado del precio de referencia
-    del mercado (ej. comerciantes con condiciones raras, errores de precio,
-    o trampas). Si no hay suficientes datos para calcular una referencia
-    confiable, no filtra nada.
-    """
-    if precio_referencia is None:
-        return precios
-    return [p for p in precios if abs(p["precio"] - precio_referencia) / precio_referencia <= UMBRAL_ATIPICO]
-
-
-def mediana(valores):
-    if not valores:
-        return None
-    valores = sorted(valores)
-    n = len(valores)
-    return valores[n // 2] if n % 2 else (valores[n // 2 - 1] + valores[n // 2]) / 2
-
-
 def construir_respuesta():
     bingx_compra, bingx_venta = obtener_bingx_precios()
     fuentes = {
@@ -216,19 +184,9 @@ def construir_respuesta():
         "BingX": {"comprar": bingx_compra, "vender": bingx_venta},
     }
 
-    # El precio de referencia del mercado se calcula con la mediana de TODOS
-    # los anuncios (compra + venta, de las tres plataformas juntas). Usar el
-    # mercado completo como referencia -en vez de comparar "venta contra venta"
-    # únicamente- evita que un grupo pequeño de anuncios de venta ya inflados
-    # se validen entre sí como si fueran "normales".
-    todos = [p["precio"] for lados in fuentes.values() for p in lados["comprar"] + lados["vender"]]
-    precio_referencia = mediana(todos)
-
     compra, venta = [], []
     for plataforma, lados in fuentes.items():
-        c_validos = filtrar_atipicos(lados["comprar"], precio_referencia)
-        v_validos = filtrar_atipicos(lados["vender"], precio_referencia)
-        mc, mv = mejor(c_validos, "comprar"), mejor(v_validos, "vender")
+        mc, mv = mejor(lados["comprar"], "comprar"), mejor(lados["vender"], "vender")
         if mc:
             compra.append({"plataforma": plataforma, **mc})
         if mv:
