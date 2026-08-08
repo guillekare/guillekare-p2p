@@ -29,11 +29,119 @@ Endpoint principal:
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import requests
 import time
 import traceback
+import asyncio
+import os
 
-app = FastAPI(title="Comparador P2P USDT/VES")
+# ------------------------------------------------------------------
+# Configuracion de alertas automaticas y direcciones de transferencia
+# rapida entre Binance y OKX (via red TRC20, la de menor comision para
+# USDT). Estos 3 valores conviene moverlos a variables de entorno en
+# Railway (Settings -> Variables) en vez de dejarlos escritos aqui, ya
+# que son datos personales tuyos aunque no sean secretos como una
+# contrasena.
+# ------------------------------------------------------------------
+DIRECCION_BINANCE = os.environ.get("DIRECCION_BINANCE", "")
+DIRECCION_OKX = os.environ.get("DIRECCION_OKX", "")
+RED_TRANSFERENCIA = os.environ.get("RED_TRANSFERENCIA", "BEP20")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "guillekare-p2p-arbitraje")
+UMBRAL_SPREAD_PCT = float(os.environ.get("UMBRAL_SPREAD_PCT", "1.0"))
+INTERVALO_CHEQUEO_SEGUNDOS = 60
+COOLDOWN_ALERTA_SEGUNDOS = 300  # no repetir la misma alerta antes de 5 min
+
+_ultima_alerta = {"ts": 0, "clave": None}
+
+def calcular_spread_binance_okx():
+    """
+    Calcula las 2 direcciones posibles de arbitraje entre Binance y OKX
+    (comprar en Binance y vender en OKX, o al reves) y devuelve la mejor
+    opcion disponible en este momento, con el spread en porcentaje.
+    """
+    binance_compra = obtener_binance("BUY")
+    binance_venta = obtener_binance("SELL")
+    okx_compra = obtener_okx("sell")
+    okx_venta = obtener_okx("buy")
+
+    mejor_binance_compra = mejor(binance_compra, "comprar")
+    mejor_binance_venta = mejor(binance_venta, "vender")
+    mejor_okx_compra = mejor(okx_compra, "comprar")
+    mejor_okx_venta = mejor(okx_venta, "vender")
+
+    opciones = []
+    if mejor_binance_compra and mejor_okx_venta:
+        spread = mejor_okx_venta["precio"] - mejor_binance_compra["precio"]
+        pct = round((spread / mejor_binance_compra["precio"]) * 100, 2)
+        opciones.append({
+            "comprar_en": "Binance", "precio_compra": mejor_binance_compra["precio"],
+            "vender_en": "OKX", "precio_venta": mejor_okx_venta["precio"],
+            "spread_pct": pct,
+        })
+    if mejor_okx_compra and mejor_binance_venta:
+        spread = mejor_binance_venta["precio"] - mejor_okx_compra["precio"]
+        pct = round((spread / mejor_okx_compra["precio"]) * 100, 2)
+        opciones.append({
+            "comprar_en": "OKX", "precio_compra": mejor_okx_compra["precio"],
+            "vender_en": "Binance", "precio_venta": mejor_binance_venta["precio"],
+            "spread_pct": pct,
+        })
+
+    if not opciones:
+        return None
+    return max(opciones, key=lambda o: o["spread_pct"])
+
+
+def enviar_push_ntfy(titulo: str, mensaje: str):
+    try:
+        requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=mensaje.encode("utf-8"),
+            headers={"Title": titulo.encode("utf-8"), "Priority": "high", "Tags": "moneybag"},
+            timeout=10,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+async def loop_vigilancia_spread():
+    while True:
+        try:
+            oportunidad = calcular_spread_binance_okx()
+            if oportunidad and oportunidad["spread_pct"] >= UMBRAL_SPREAD_PCT:
+                clave = f"{oportunidad['comprar_en']}->{oportunidad['vender_en']}"
+                ahora = time.time()
+                ya_avisado_hace_poco = (
+                    _ultima_alerta["clave"] == clave
+                    and (ahora - _ultima_alerta["ts"]) < COOLDOWN_ALERTA_SEGUNDOS
+                )
+                if not ya_avisado_hace_poco:
+                    direccion_destino = (
+                        DIRECCION_OKX if oportunidad["vender_en"] == "OKX" else DIRECCION_BINANCE
+                    )
+                    mensaje = (
+                        f"Comprar en {oportunidad['comprar_en']} a {oportunidad['precio_compra']} VES\n"
+                        f"Vender en {oportunidad['vender_en']} a {oportunidad['precio_venta']} VES\n"
+                        f"Spread: {oportunidad['spread_pct']}%\n"
+                        f"Enviar USDT ({RED_TRANSFERENCIA}) a: {direccion_destino or 'no configurada'}"
+                    )
+                    enviar_push_ntfy(f"Oportunidad P2P: {oportunidad['spread_pct']}%", mensaje)
+                    _ultima_alerta["ts"] = ahora
+                    _ultima_alerta["clave"] = clave
+        except Exception:
+            traceback.print_exc()
+        await asyncio.sleep(INTERVALO_CHEQUEO_SEGUNDOS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    tarea = asyncio.create_task(loop_vigilancia_spread())
+    yield
+    tarea.cancel()
+
+
+app = FastAPI(title="Comparador P2P USDT/VES", lifespan=lifespan)
 
 # Permite que la PWA (desde cualquier origen) consuma esta API
 app.add_middleware(
@@ -267,6 +375,9 @@ def mejor(precios, modo):
     return min(precios, key=lambda x: x["precio"]) if modo == "comprar" else max(precios, key=lambda x: x["precio"])
 
 
+PLATAFORMAS_CONFIABLES = {"Binance", "OKX"}
+
+
 def construir_respuesta():
     bingx_compra, bingx_venta = obtener_bingx_precios()
     bybit_compra, bybit_venta = obtener_bybit_precios()
@@ -281,10 +392,11 @@ def construir_respuesta():
     compra, venta = [], []
     for plataforma, lados in fuentes.items():
         mc, mv = mejor(lados["comprar"], "comprar"), mejor(lados["vender"], "vender")
+        confiable = plataforma in PLATAFORMAS_CONFIABLES
         if mc:
-            compra.append({"plataforma": plataforma, **mc})
+            compra.append({"plataforma": plataforma, "confiable": confiable, **mc})
         if mv:
-            venta.append({"plataforma": plataforma, **mv})
+            venta.append({"plataforma": plataforma, "confiable": confiable, **mv})
 
     compra.sort(key=lambda x: x["precio"])
     venta.sort(key=lambda x: x["precio"], reverse=True)
@@ -318,6 +430,33 @@ def precios():
 @app.get("/")
 def health():
     return {"status": "ok", "servicio": "Comparador P2P USDT/VES"}
+
+
+@app.get("/api/direcciones")
+def direcciones():
+    """
+    Direcciones de deposito USDT guardadas para transferencia rapida entre
+    Binance y OKX. Configuralas en Railway -> Variables:
+    DIRECCION_BINANCE, DIRECCION_OKX y RED_TRANSFERENCIA (ej: BEP20, TRC20).
+    """
+    return {
+        "red": RED_TRANSFERENCIA,
+        "binance": DIRECCION_BINANCE or None,
+        "okx": DIRECCION_OKX or None,
+    }
+
+
+@app.get("/api/spread-binance-okx")
+def spread_binance_okx():
+    """
+    Calcula en vivo la mejor oportunidad de arbitraje entre Binance y OKX
+    (las 2 unicas fuentes con datos confiables en tiempo real), en ambas
+    direcciones, y devuelve la mejor.
+    """
+    oportunidad = calcular_spread_binance_okx()
+    if not oportunidad:
+        return {"disponible": False}
+    return {"disponible": True, **oportunidad, "umbral_configurado_pct": UMBRAL_SPREAD_PCT}
 
 
 @app.get("/api/debug/okx")
