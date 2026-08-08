@@ -65,6 +65,22 @@ _cache = {"data": None, "ts": 0}
 CACHE_SEGUNDOS = 45
 
 
+# Metodos de pago que no son transferencia bancaria/pago movil normal (por
+# ejemplo recargas de saldo telefonico, tarjetas de regalo, etc.) y por eso
+# suelen tener precios fuera de mercado que no son comparables con las demas
+# plataformas. Se excluyen de Binance para que la comparacion sea justa.
+METODOS_PAGO_EXCLUIDOS = {
+    "recarga pines", "recarga de saldo", "recargas de saldo",
+    "gift card", "tarjeta de regalo", "efectivo", "cash",
+}
+
+
+def es_metodo_pago_valido(nombre_metodo: str) -> bool:
+    if not nombre_metodo:
+        return True
+    return nombre_metodo.strip().lower() not in METODOS_PAGO_EXCLUIDOS
+
+
 def obtener_binance(trade_type: str):
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     payload = {
@@ -96,6 +112,10 @@ def obtener_binance(trade_type: str):
                     continue
             except (TypeError, ValueError):
                 pass
+            metodos_pago = adv.get("tradeMethods", [])
+            nombre_metodo = metodos_pago[0].get("tradeMethodName") if metodos_pago else None
+            if not es_metodo_pago_valido(nombre_metodo):
+                continue
             precios.append({
                 "precio": float(adv["price"]),
                 "comerciante": item["advertiser"]["nickName"],
