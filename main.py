@@ -1,4 +1,3 @@
-
 """
 Backend del Comparador P2P USDT/VES
 =====================================
@@ -89,6 +88,14 @@ def obtener_binance(trade_type: str):
                 continue
             if adv.get("isTradable") is False:
                 continue
+            # Anuncios con muy poca cantidad disponible (ej: 1-2 USDT) suelen
+            # ser "trampa" con precios irreales que en la practica nadie
+            # puede operar de forma significativa. Los descartamos.
+            try:
+                if float(adv.get("surplusAmount", 0)) < 10:
+                    continue
+            except (TypeError, ValueError):
+                pass
             precios.append({
                 "precio": float(adv["price"]),
                 "comerciante": item["advertiser"]["nickName"],
@@ -301,15 +308,17 @@ def debug_okx():
 
 
 @app.get("/api/debug/binance")
-def debug_binance():
+def debug_binance(trade_type: str = "BUY"):
     """
     Devuelve un resumen legible de los anuncios de Binance (precio,
-    comerciante, y si requieren KYC adicional o no son operables), para
-    diagnosticar diferencias contra lo que muestra la app/web oficial.
+    comerciante, cantidad disponible, y si requieren KYC adicional o no son
+    operables), para diagnosticar diferencias contra lo que muestra la
+    app/web oficial. Usar ?trade_type=SELL en la URL para ver el lado de
+    "vender" (los compradores que le pagan al usuario).
     """
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     payload = {
-        "asset": ASSET, "fiat": FIAT, "tradeType": "BUY",
+        "asset": ASSET, "fiat": FIAT, "tradeType": trade_type.upper(),
         "page": 1, "rows": ROWS, "payTypes": [], "publisherType": None,
     }
     try:
@@ -319,6 +328,7 @@ def debug_binance():
             {
                 "precio": adv.get("price"),
                 "comerciante": item.get("advertiser", {}).get("nickName"),
+                "cantidad_disponible": adv.get("surplusAmount"),
                 "kyc_adicional_requerido": adv.get("takerAdditionalKycRequired"),
                 "es_operable": adv.get("isTradable"),
                 "metodo_pago": adv.get("tradeMethods", [{}])[0].get("tradeMethodName") if adv.get("tradeMethods") else None,
@@ -328,6 +338,7 @@ def debug_binance():
         ]
         return {
             "status_code": r.status_code,
+            "trade_type": trade_type.upper(),
             "cantidad_anuncios": len(resumen),
             "anuncios": resumen,
         }
