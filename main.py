@@ -184,7 +184,16 @@ def obtener_p2p_army(market: str, nombre_debug: str):
     Sirve tanto para BingX como para Bybit (y cualquier otra que soporte
     P2P.Army: binance, bybit, huobi, okx, bitget, bingx, kucoin, mexc).
     Devuelve una tupla (lista_comprar, lista_vender).
+
+    Nota: P2P.Army no entrega cantidad disponible ni limites de transaccion
+    por anuncio, asi que no podemos filtrar anuncios "inelegibles" (poca
+    cantidad vs. limite minimo alto) de forma exacta como se hace con
+    Binance. En su lugar, descartamos precios que se alejan demasiado
+    (mas de MARGEN_OUTLIER) del promedio que la propia API entrega por
+    metodo de pago, ya que ese tipo de anuncios trampa suelen ser valores
+    bien atipicos.
     """
+    MARGEN_OUTLIER = 0.03  # 3%
     url = "https://p2p.army/v1/api/get_p2p_prices"
     headers = {"X-APIKEY": P2P_ARMY_API_KEY, "Content-Type": "application/json"}
     payload = {"market": market, "fiat": FIAT, "asset": ASSET, "limit": ROWS}
@@ -202,16 +211,30 @@ def obtener_p2p_army(market: str, nombre_debug: str):
         compra, venta = [], []
         for entry in body.get("prices", []):
             metodo = entry.get("payment_method", "")
+            avg_buy = entry.get("avg_price_BUY")
+            avg_sell = entry.get("avg_price_SELL")
             for precio_str in entry.get("prices_BUY", []):
                 try:
-                    compra.append({"precio": float(precio_str), "comerciante": metodo, "min": 0, "max": 0})
+                    precio = float(precio_str)
                 except (TypeError, ValueError):
                     continue
+                # Para "comprar" buscamos el precio mas BAJO, asi que
+                # descartamos los que esten demasiado por DEBAJO del
+                # promedio (sospechosos de ser ofertas trampa).
+                if avg_buy and precio < avg_buy * (1 - MARGEN_OUTLIER):
+                    continue
+                compra.append({"precio": precio, "comerciante": metodo, "min": 0, "max": 0})
             for precio_str in entry.get("prices_SELL", []):
                 try:
-                    venta.append({"precio": float(precio_str), "comerciante": metodo, "min": 0, "max": 0})
+                    precio = float(precio_str)
                 except (TypeError, ValueError):
                     continue
+                # Para "vender" buscamos el precio mas ALTO, asi que
+                # descartamos los que esten demasiado por ENCIMA del
+                # promedio.
+                if avg_sell and precio > avg_sell * (1 + MARGEN_OUTLIER):
+                    continue
+                venta.append({"precio": precio, "comerciante": metodo, "min": 0, "max": 0})
         return compra, venta
     except Exception:
         traceback.print_exc()
