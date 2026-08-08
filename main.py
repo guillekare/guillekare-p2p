@@ -188,12 +188,15 @@ def obtener_p2p_army(market: str, nombre_debug: str):
     Nota: P2P.Army no entrega cantidad disponible ni limites de transaccion
     por anuncio, asi que no podemos filtrar anuncios "inelegibles" (poca
     cantidad vs. limite minimo alto) de forma exacta como se hace con
-    Binance. En su lugar, descartamos precios que se alejan demasiado
-    (mas de MARGEN_OUTLIER) del promedio que la propia API entrega por
-    metodo de pago, ya que ese tipo de anuncios trampa suelen ser valores
-    bien atipicos.
+    Binance. En su lugar, descartamos precios que se alejan demasiado de la
+    MEDIANA de TODO el mercado (todos los metodos de pago juntos, no solo el
+    propio metodo del anuncio) ya que comparar contra el promedio de su
+    propio metodo de pago falla cuando ese metodo tiene pocos anuncios y el
+    propio outlier sesga su promedio hacia abajo/arriba.
     """
-    MARGEN_OUTLIER = 0.03  # 3%
+    import statistics
+
+    MARGEN_OUTLIER = 0.015  # 1.5% respecto a la mediana global del mercado
     url = "https://p2p.army/v1/api/get_p2p_prices"
     headers = {"X-APIKEY": P2P_ARMY_API_KEY, "Content-Type": "application/json"}
     payload = {"market": market, "fiat": FIAT, "asset": ASSET, "limit": ROWS}
@@ -208,31 +211,40 @@ def obtener_p2p_army(market: str, nombre_debug: str):
             print(f"  [{nombre_debug}/P2PArmy] Respuesta con error: {body}")
             return [], []
 
-        compra, venta = [], []
+        # Primera pasada: juntar TODOS los precios crudos (de todos los
+        # metodos de pago) para calcular la mediana global del mercado.
+        raw_buy, raw_sell = [], []
+        entradas = []
         for entry in body.get("prices", []):
             metodo = entry.get("payment_method", "")
-            avg_buy = entry.get("avg_price_BUY")
-            avg_sell = entry.get("avg_price_SELL")
+            precios_buy = []
             for precio_str in entry.get("prices_BUY", []):
                 try:
-                    precio = float(precio_str)
+                    precios_buy.append(float(precio_str))
                 except (TypeError, ValueError):
                     continue
-                # Para "comprar" buscamos el precio mas BAJO, asi que
-                # descartamos los que esten demasiado por DEBAJO del
-                # promedio (sospechosos de ser ofertas trampa).
-                if avg_buy and precio < avg_buy * (1 - MARGEN_OUTLIER):
-                    continue
-                compra.append({"precio": precio, "comerciante": metodo, "min": 0, "max": 0})
+            precios_sell = []
             for precio_str in entry.get("prices_SELL", []):
                 try:
-                    precio = float(precio_str)
+                    precios_sell.append(float(precio_str))
                 except (TypeError, ValueError):
                     continue
-                # Para "vender" buscamos el precio mas ALTO, asi que
-                # descartamos los que esten demasiado por ENCIMA del
-                # promedio.
-                if avg_sell and precio > avg_sell * (1 + MARGEN_OUTLIER):
+            raw_buy.extend(precios_buy)
+            raw_sell.extend(precios_sell)
+            entradas.append((metodo, precios_buy, precios_sell))
+
+        mediana_buy = statistics.median(raw_buy) if raw_buy else None
+        mediana_sell = statistics.median(raw_sell) if raw_sell else None
+
+        # Segunda pasada: filtrar contra la mediana global.
+        compra, venta = [], []
+        for metodo, precios_buy, precios_sell in entradas:
+            for precio in precios_buy:
+                if mediana_buy and precio < mediana_buy * (1 - MARGEN_OUTLIER):
+                    continue
+                compra.append({"precio": precio, "comerciante": metodo, "min": 0, "max": 0})
+            for precio in precios_sell:
+                if mediana_sell and precio > mediana_sell * (1 + MARGEN_OUTLIER):
                     continue
                 venta.append({"precio": precio, "comerciante": metodo, "min": 0, "max": 0})
         return compra, venta
@@ -410,8 +422,10 @@ def debug_bybit():
     """
     Devuelve un resumen legible de los anuncios de Bybit por metodo de pago
     (precio minimo/maximo de compra y venta, y el timestamp de actualizacion
-    que entrega P2P.Army), para diagnosticar si algun precio quedo "pegado".
+    que entrega P2P.Army), mas la mediana global usada para filtrar
+    outliers, para diagnosticar el filtrado.
     """
+    import statistics
     url = "https://p2p.army/v1/api/get_p2p_prices"
     headers = {"X-APIKEY": P2P_ARMY_API_KEY, "Content-Type": "application/json"}
     payload = {"market": "bybit", "fiat": FIAT, "asset": ASSET, "limit": ROWS}
@@ -419,16 +433,23 @@ def debug_bybit():
         r = requests.post(url, json=payload, headers=headers, timeout=10)
         body = r.json()
         resumen = []
+        raw_buy, raw_sell = [], []
         for entry in body.get("prices", []):
+            precios_buy = [float(p) for p in entry.get("prices_BUY", []) if p]
+            precios_sell = [float(p) for p in entry.get("prices_SELL", []) if p]
+            raw_buy.extend(precios_buy)
+            raw_sell.extend(precios_sell)
             resumen.append({
                 "metodo_pago": entry.get("payment_method"),
                 "updated_BUY": entry.get("updated_BUY"),
                 "updated_SELL": entry.get("updated_SELL"),
-                "precio_min_BUY": min((float(p) for p in entry.get("prices_BUY", [])), default=None),
-                "precio_min_SELL": min((float(p) for p in entry.get("prices_SELL", [])), default=None),
+                "precio_min_BUY": min(precios_buy, default=None),
+                "precio_min_SELL": min(precios_sell, default=None),
             })
         return {
             "status_code": r.status_code,
+            "mediana_BUY_mercado": statistics.median(raw_buy) if raw_buy else None,
+            "mediana_SELL_mercado": statistics.median(raw_sell) if raw_sell else None,
             "cantidad_metodos_pago": len(resumen),
             "metodos": resumen,
         }
