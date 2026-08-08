@@ -25,10 +25,17 @@ P2P.Army, que ya tiene acceso autorizado a ambas exchanges.
 
 Endpoint principal:
     GET /api/precios  -> JSON con mejor compra, mejor venta y spread
+
+Pantalla de alerta:
+    GET /alerta  -> pagina HTML simple, pensada para abrirse desde el
+    celular al tocar la notificacion push. Muestra el spread, los precios,
+    y un boton para copiar la direccion de deposito correspondiente sin
+    tener que ir a buscarla a mano.
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 import requests
 import time
@@ -53,6 +60,12 @@ INTERVALO_CHEQUEO_SEGUNDOS = 60
 COOLDOWN_ALERTA_SEGUNDOS = 300  # no repetir la misma alerta antes de 5 min
 
 _ultima_alerta = {"ts": 0, "clave": None}
+
+# Guarda los datos completos de la ultima oportunidad detectada, para que
+# la pantalla /alerta pueda mostrarlos cuando el usuario toca la
+# notificacion en su celular.
+_ultima_oportunidad_completa = {}
+
 
 def calcular_spread_binance_okx():
     """
@@ -93,16 +106,40 @@ def calcular_spread_binance_okx():
     return max(opciones, key=lambda o: o["spread_pct"])
 
 
-def enviar_push_ntfy(titulo: str, mensaje: str):
+def enviar_push_ntfy(titulo: str, mensaje: str, click_url: str | None = None):
+    """
+    Manda la notificacion push via ntfy.sh. Si se pasa click_url, la
+    notificacion queda configurada para que, al tocarla en el celular, se
+    abra directamente esa pagina (la pantalla /alerta) en el navegador,
+    sin tener que buscar nada a mano.
+    """
     try:
+        headers = {
+            "Title": titulo.encode("utf-8"),
+            "Priority": "high",
+            "Tags": "moneybag",
+        }
+        if click_url:
+            headers["Click"] = click_url
         requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=mensaje.encode("utf-8"),
-            headers={"Title": titulo.encode("utf-8"), "Priority": "high", "Tags": "moneybag"},
+            headers=headers,
             timeout=10,
         )
     except Exception:
         traceback.print_exc()
+
+
+def _url_publica_actual() -> str:
+    """
+    Intenta armar la URL publica de este mismo servicio (para el boton de
+    la notificacion), usando la variable que Railway agrega
+    automaticamente. Si no la encuentra, devuelve vacio y simplemente no
+    se agrega el boton de "abrir pantalla".
+    """
+    dominio = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    return f"https://{dominio}" if dominio else ""
 
 
 async def loop_vigilancia_spread():
@@ -126,7 +163,26 @@ async def loop_vigilancia_spread():
                         f"Spread: {oportunidad['spread_pct']}%\n"
                         f"Enviar USDT ({RED_TRANSFERENCIA}) a: {direccion_destino or 'no configurada'}"
                     )
-                    enviar_push_ntfy(f"Oportunidad P2P: {oportunidad['spread_pct']}%", mensaje)
+
+                    _ultima_oportunidad_completa.update({
+                        "comprar_en": oportunidad["comprar_en"],
+                        "precio_compra": oportunidad["precio_compra"],
+                        "vender_en": oportunidad["vender_en"],
+                        "precio_venta": oportunidad["precio_venta"],
+                        "spread_pct": oportunidad["spread_pct"],
+                        "direccion": direccion_destino,
+                        "red": RED_TRANSFERENCIA,
+                        "actualizado": int(ahora),
+                    })
+
+                    base_url = _url_publica_actual()
+                    click_url = f"{base_url}/alerta" if base_url else None
+
+                    enviar_push_ntfy(
+                        f"Oportunidad P2P: {oportunidad['spread_pct']}%",
+                        mensaje,
+                        click_url=click_url,
+                    )
                     _ultima_alerta["ts"] = ahora
                     _ultima_alerta["clave"] = clave
         except Exception:
@@ -457,6 +513,72 @@ def spread_binance_okx():
     if not oportunidad:
         return {"disponible": False}
     return {"disponible": True, **oportunidad, "umbral_configurado_pct": UMBRAL_SPREAD_PCT}
+
+
+@app.get("/alerta", response_class=HTMLResponse)
+def alerta():
+    """
+    Pantalla pensada para abrirse desde el celular al tocar la notificacion
+    push. Muestra la ultima oportunidad detectada en grande, con un boton
+    para copiar la direccion de deposito correspondiente sin tener que
+    buscarla a mano en ningun lado.
+    """
+    o = _ultima_oportunidad_completa
+    if not o:
+        return """
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+        <body style="font-family:-apple-system,sans-serif;background:#0f172a;color:white;
+        text-align:center;padding-top:35vh;margin:0;">
+        <h2>Todavia no hay ninguna alerta registrada</h2>
+        <p style="color:#94a3b8">En cuanto aparezca una oportunidad, esta pantalla se va a
+        actualizar sola.</p>
+        </body></html>
+        """
+    direccion = o.get("direccion") or "no configurada"
+    return f"""
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Oportunidad P2P</title>
+      <style>
+        body {{
+          font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+          background: #0f172a; color: white; text-align: center;
+          margin: 0; padding: 32px 20px; min-height: 100vh; box-sizing: border-box;
+        }}
+        .spread {{ font-size: 56px; color: #22c55e; font-weight: 800; margin: 8px 0 24px; }}
+        .fila {{ font-size: 20px; margin: 10px 0; color: #e2e8f0; }}
+        .fila b {{ color: white; }}
+        .direccion {{
+          background: #1e293b; padding: 20px; border-radius: 16px;
+          margin: 28px 0 16px; word-break: break-all; font-size: 17px;
+          font-family: monospace; border: 1px solid #334155;
+        }}
+        .red {{ color: #94a3b8; font-size: 14px; margin-bottom: 6px; }}
+        button {{
+          background: #22c55e; color: #0f172a; border: none;
+          padding: 16px 28px; border-radius: 12px; font-size: 18px;
+          font-weight: 700; width: 100%; max-width: 320px; box-sizing: border-box;
+        }}
+        .actualizado {{ color: #64748b; font-size: 13px; margin-top: 24px; }}
+      </style>
+    </head>
+    <body>
+      <h2 style="margin-bottom:0">Oportunidad de arbitraje</h2>
+      <div class="spread">{o['spread_pct']}%</div>
+      <div class="fila">Comprar en <b>{o['comprar_en']}</b> a <b>{o['precio_compra']}</b> VES</div>
+      <div class="fila">Vender en <b>{o['vender_en']}</b> a <b>{o['precio_venta']}</b> VES</div>
+      <div class="direccion">
+        <div class="red">Enviar USDT ({o['red']}) a esta direccion:</div>
+        <b id="dir">{direccion}</b>
+      </div>
+      <button onclick="navigator.clipboard.writeText('{direccion}').then(()=>{{this.innerText='Direccion copiada';}})">
+        Copiar direccion
+      </button>
+      <div class="actualizado">Actualizado hace instantes</div>
+    </body>
+    </html>
+    """
 
 
 @app.get("/api/debug/okx")
