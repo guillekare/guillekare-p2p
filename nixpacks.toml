@@ -1,9 +1,1 @@
-[phases.setup]
-nixPkgsArchive = "nixpkgs-unstable"
-nixPkgs = ["python311", "chromium"]
 
-[phases.install]
-cmds = [
-  "pip install -r requirements.txt",
-  "playwright install --with-deps chromium"
-]
